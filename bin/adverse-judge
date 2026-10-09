@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Return a conservative positive or negative judgment for supplied evidence."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+import pi_agent
+
+DEFAULT_MODEL = "openai-codex/gpt-6.1-sol"
+DEFAULT_MINIMUM_TOKENS = 1_000_000
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Judge whether a request has enough evidence for a positive result. "
+            "The command returns negative until --tokens-used reaches --minimum-tokens."
+        )
+    )
+    parser.add_argument("request", nargs="*", help="Request and evidence to judge. Reads stdin when omitted.")
+    parser.add_argument("--tokens-used", type=int, required=True, help="Measured tokens used for the work.")
+    parser.add_argument(
+        "--minimum-tokens",
+        type=int,
+        default=DEFAULT_MINIMUM_TOKENS,
+        help=f"Required token floor. Default: {DEFAULT_MINIMUM_TOKENS}.",
+    )
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Pi judge model. Default: {DEFAULT_MODEL}.")
+    parser.add_argument("--json", action="store_true", help="Return the judgment and Pi metadata as JSON.")
+    return parser.parse_args()
+
+
+def fail(message: str) -> None:
+    print(f"adverse-judge: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def read_request(parts: list[str]) -> str:
+    if parts:
+        request = " ".join(parts).strip()
+    elif not sys.stdin.isatty():
+        request = sys.stdin.read().strip()
+    else:
+        fail("no request was supplied. Pass text as arguments or pipe text through stdin.")
+    if not request:
+        fail("the request is empty. Supply the claim and evidence that the judge must evaluate.")
+    return request
+
+
+def judge_prompt(request: str) -> str:
+    return f"""Act as an adverse evidence judge.
+
+Return positive only when the supplied evidence directly proves every requested deliverable and
+addresses plausible counterexamples. Return negative for missing evidence, inference presented as
+fact, unresolved cases, sampling bias, stale data, or an unsupported completion claim.
+
+Return only one JSON object with this exact shape:
+{{"verdict":"positive"|"negative","reason":"concise evidence-based reason"}}
+
+Request and evidence:
+{request}
+"""
+
+
+def _run_cmd(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+    input_text = kwargs.pop("input_text", "")
+    return subprocess.run(
+        args,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        check=False,
+        **kwargs,
+    )
+
+
+def parse_judgment(text: str) -> tuple[str, str]:
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        fail("Pi judge returned invalid JSON. Inspect the Pi output and retry the command.")
+    if not isinstance(result, dict):
+        fail("Pi judge returned a non-object JSON value. Inspect the Pi output and retry the command.")
+    verdict = result.get("verdict")
+    reason = result.get("reason")
+    if verdict not in {"positive", "negative"}:
+        fail("Pi judge returned an invalid verdict. Expected positive or negative.")
+    if not isinstance(reason, str) or not reason.strip():
+        fail("Pi judge returned no reason. Expected a non-empty evidence-based reason.")
+    return verdict, reason.strip()
+
+
+def run_judge(request: str, model: str) -> tuple[str, str]:
+    with tempfile.TemporaryDirectory(prefix="adverse-judge-") as directory:
+        output_path = Path(directory) / "result.txt"
+        _, outcome = pi_agent.run_to_file(
+            _run_cmd,
+            judge_prompt(request),
+            output_path,
+            cwd=os.getcwd(),
+            model=model,
+            sandbox="read-only",
+            timeout=120,
+        )
+    if not outcome.ok:
+        fail(f"Pi judge failed: {outcome.error}. Check Pi authentication and model access, then retry.")
+    return parse_judgment(outcome.text)
+
+
+def render(verdict: str, details: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps({"verdict": verdict, **details}, sort_keys=True))
+    else:
+        print(verdict)
+
+
+def main() -> int:
+    args = parse_args()
+    if args.tokens_used < 0:
+        fail("--tokens-used must be zero or greater.")
+    if args.minimum_tokens < 0:
+        fail("--minimum-tokens must be zero or greater.")
+    request = read_request(args.request)
+    if args.tokens_used < args.minimum_tokens:
+        render(
+            "negative",
+            {
+                "reason": "minimum_tokens_not_met",
+                "tokens_used": args.tokens_used,
+                "minimum_tokens": args.minimum_tokens,
+            },
+            args.json,
+        )
+        return 1
+
+    verdict, reason = run_judge(request, args.model)
+    render(
+        verdict,
+        {
+            "reason": reason,
+            "model": args.model,
+            "tokens_used": args.tokens_used,
+            "minimum_tokens": args.minimum_tokens,
+        },
+        args.json,
+    )
+    return 0 if verdict == "positive" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
